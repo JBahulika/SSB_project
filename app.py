@@ -1,53 +1,17 @@
+import hashlib
+
 import streamlit as st
-import pypdf
-import os
-import torch
-import numpy as np
-import faiss
-from sentence_transformers import SentenceTransformer
-from transformers import pipeline
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# --- 1. PAGE CONFIG ---
+from llm import answer_question, generate_quiz_cards, summarize_notes
+from rag import build_index, chunk_pages, extract_pdf_pages, search
+
+MIN_CHARS = 50
+RESULT_KEYS = ("ready", "summary", "chunks", "index", "messages", "quiz")
+
 st.set_page_config(page_title="Smart Study Buddy", page_icon="🎓", layout="wide")
-
-# --- 2. DARK THEME & UI STYLING (CLEANED) ---
-st.markdown("""
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
+st.markdown(
+    """
     <style>
-    .stApp { 
-        background-color: #0E1117; 
-        color: #FAFAFA; 
-    }
-    .info-box {
-        background-color: #1E2129;
-        padding: 20px;
-        border-radius: 10px;
-        border-left: 5px solid #4CAF50;
-        color: #FFFFFF;
-        margin: 10px 0;
-        line-height: 1.7;
-    }
-    h1, h2, h3 { color: #4CAF50 !important; }
-    .sidebar-link {
-        display: flex;
-        align-items: center;
-        padding: 10px 15px;
-        background-color: #262730;
-        color: #4CAF50 !important;
-        text-decoration: none;
-        border-radius: 8px;
-        margin: 8px 0;
-        font-weight: bold;
-    }
-    .sidebar-link i {
-        margin-right: 12px;
-        font-size: 1.2rem;
-    }
-    .sidebar-link:hover { 
-        background-color: #4CAF50; 
-        color: white !important; 
-    }
     div.stButton > button {
         background-color: #4CAF50 !important;
         color: white !important;
@@ -58,107 +22,185 @@ st.markdown("""
         border: none !important;
     }
     </style>
-    """, unsafe_allow_html=True)
+    """,
+    unsafe_allow_html=True,
+)
 
-# --- 3. LOAD MODELS ---
+
 @st.cache_resource
 def load_models():
-    embedder = SentenceTransformer('all-MiniLM-L6-v2')
+    from sentence_transformers import SentenceTransformer
+    from transformers import pipeline
+
+    embedder = SentenceTransformer("all-MiniLM-L6-v2")
     qa_pipe = pipeline("text2text-generation", model="google/flan-t5-large")
     return embedder, qa_pipe
 
-embedder, qa_pipe = load_models()
 
-# --- 4. HELPERS ---
-def extract_pdf_text(pdf_file):
-    reader = pypdf.PdfReader(pdf_file)
-    text = ""
-    for page in reader.pages:
-        content = page.extract_text()
-        if content:
-            text += content + "\n"
-    return text
+def fingerprint(pages, filename=""):
+    digest = hashlib.sha256()
+    digest.update((filename or "").encode())
+    for page in pages:
+        digest.update(str(page.get("page")).encode())
+        digest.update(page["text"].encode())
+    return digest.hexdigest()
 
-# --- 5. SIDEBAR ---
+
+def clear_results():
+    for key in RESULT_KEYS:
+        st.session_state.pop(key, None)
+
+
+def source_label(hit):
+    return f"Page {hit['page']}" if hit.get("page") else "Notes"
+
+
+def render_sources(hits):
+    with st.expander("Sources"):
+        for hit in hits:
+            st.caption(f"{source_label(hit)} · similarity {hit['score']:.2f}")
+            st.write(hit["text"])
+
+
 with st.sidebar:
-    st.header("👤 About Me")
+    st.header("About")
     st.info("Built by J Bahulika")
-    
-    st.header("🔗 Connect")
-    st.markdown(f"""
-        <a href="https://www.linkedin.com/in/j-bahulika-8b8237207/" class="sidebar-link" target="_blank">
-            <i class="fab fa-linkedin"></i> LinkedIn Profile
-        </a>
-        <a href="https://github.com/JBahulika" class="sidebar-link" target="_blank">
-            <i class="fab fa-github"></i> GitHub Portfolio
-        </a>
-    """, unsafe_allow_html=True)
-    
-    st.divider()
-    st.header("📁 Upload Center")
-    file = st.file_uploader("Upload Notes (PDF)", type="pdf")
+    st.header("Connect")
+    st.link_button("LinkedIn", "https://www.linkedin.com/in/j-bahulika-8b8237207/")
+    st.link_button("GitHub", "https://github.com/JBahulika")
 
-# --- 6. MAIN UI ---
 st.title("🎓 Smart Study Buddy")
+st.caption("Summarize notes, ask questions with sources, and quiz yourself.")
 
-input_method = st.radio("Input Selection:", ["Paste Text", "Upload PDF"], horizontal=True)
+input_method = st.radio("Input selection", ["Paste text", "Upload PDF"], horizontal=True)
+pages = []
+filename = ""
 
-user_input = ""
-if input_method == "Paste Text":
-    user_input = st.text_area("Paste your study material here:", height=250)
+if input_method == "Paste text":
+    pasted = st.text_area("Paste your study material here:", height=250)
+    if pasted.strip():
+        pages = [{"page": None, "text": pasted.strip()}]
 else:
-    if file:
-        user_input = extract_pdf_text(file)
+    uploaded = st.file_uploader("Upload notes (PDF)", type="pdf")
+    if uploaded:
+        filename = uploaded.name
+        pages = extract_pdf_pages(uploaded)
+        if pages:
+            st.caption(f"{uploaded.name} · {len(pages)} page(s) with extractable text")
+        else:
+            st.warning("Could not extract text. This PDF may be scanned or image-only.")
     else:
-        st.info("Please upload a PDF file in the sidebar to get started.")
+        st.info("Upload a PDF to get started.")
 
-# THE GENERATE BUTTON
-if st.button("GENERATE SUMMARY"):
-    if not user_input or len(user_input.strip()) < 50:
-        st.error("Please provide at least 50 characters of text.")
+char_count = sum(len(page["text"]) for page in pages)
+source_key = fingerprint(pages, filename) if pages else ""
+if st.session_state.get("source_key") != source_key:
+    clear_results()
+    st.session_state["source_key"] = source_key
+
+can_generate = char_count >= MIN_CHARS
+if pages and not can_generate:
+    st.caption(f"Add at least {MIN_CHARS} characters before generating.")
+
+if st.button("Generate study pack", disabled=not can_generate):
+    embedder, qa_pipe = load_models()
+    chunks = chunk_pages(pages)
+    if not chunks:
+        st.error("Not enough extractable text to study.")
     else:
-        with st.spinner("Analyzing your material..."):
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=100)
-            chunks = text_splitter.split_text(user_input)
-            
-            embeddings = embedder.encode(chunks)
-            index = faiss.IndexFlatL2(embeddings.shape[1])
-            index.add(np.array(embeddings).astype('float32'))
-            
-            summary_context = " ".join(chunks[:3]) 
-            summary_prompt = f"Summarize these notes clearly: {summary_context}"
-            summary_out = qa_pipe(summary_prompt, max_length=512, do_sample=True, repetition_penalty=2.5)[0]['generated_text']
-            
-            st.session_state['ready'] = True
-            st.session_state['summary'] = summary_out
-            st.session_state['chunks'] = chunks
-            st.session_state['index'] = index
+        progress = st.progress(0.0, text="Indexing notes...")
+        index = build_index(embedder, chunks)
+
+        def on_progress(done, total, label):
+            progress.progress(min(done / total, 1.0), text=label)
+
+        summary = summarize_notes(qa_pipe, chunks, on_progress=on_progress)
+        progress.empty()
+        st.session_state.ready = True
+        st.session_state.summary = summary
+        st.session_state.chunks = chunks
+        st.session_state.index = index
+        st.session_state.messages = []
+        st.session_state.quiz = None
+        st.rerun()
 
 st.divider()
 
-# --- 7. RESULTS AREA ---
-if st.session_state.get('ready'):
-    col1, col2 = st.columns([1, 1], gap="large")
-    
-    with col1:
-        st.subheader("📝 Detailed Summary")
-        st.markdown(f'<div class="info-box">{st.session_state["summary"]}</div>', unsafe_allow_html=True)
-    
-    with col2:
-        st.subheader("🔍 Ask Questions")
-        query = st.text_input("Ask a specific question about your document:", placeholder="e.g. What is the main conclusion?")
-        
+if st.session_state.get("ready"):
+    chunk_count = len(st.session_state["chunks"])
+    st.caption(f"Indexed {chunk_count} chunk(s) from your notes.")
+    summary_tab, ask_tab, quiz_tab = st.tabs(["Summary", "Ask questions", "Quiz"])
+
+    with summary_tab:
+        st.subheader("Study summary")
+        with st.container(border=True):
+            st.write(st.session_state["summary"])
+        st.download_button(
+            "Download summary",
+            data=st.session_state["summary"],
+            file_name="study-summary.txt",
+            mime="text/plain",
+        )
+
+    with ask_tab:
+        st.subheader("Ask about your notes")
+        for message in st.session_state.get("messages", []):
+            with st.chat_message(message["role"]):
+                st.write(message["content"])
+                if message["role"] == "assistant" and message.get("sources"):
+                    render_sources(message["sources"])
+
+        query = st.chat_input("Ask a specific question about your notes")
         if query:
-            with st.spinner("Searching..."):
-                query_vec = embedder.encode([query])
-                _, indices = st.session_state['index'].search(np.array(query_vec).astype('float32'), k=2)
-                context = " ".join([st.session_state['chunks'][i] for i in indices[0]])
-                
-                ans_prompt = f"Context: {context}\n\nQuestion: {query}\n\nAnswer:"
-                answer = qa_pipe(ans_prompt, max_length=250)[0]['generated_text']
-                st.markdown(f'<div class="info-box"><b>AI Buddy:</b><br>{answer}</div>', unsafe_allow_html=True)
+            embedder, qa_pipe = load_models()
+            st.session_state.messages.append({"role": "user", "content": query})
+            with st.chat_message("user"):
+                st.write(query)
+            with st.chat_message("assistant"):
+                with st.spinner("Searching your notes..."):
+                    hits = search(
+                        embedder,
+                        st.session_state["index"],
+                        st.session_state["chunks"],
+                        query,
+                    )
+                    answer = answer_question(qa_pipe, query, hits)
+                st.write(answer)
+                if hits:
+                    render_sources(hits)
+            st.session_state.messages.append(
+                {"role": "assistant", "content": answer, "sources": hits}
+            )
+
+    with quiz_tab:
+        st.subheader("Quiz yourself")
+        if st.button("Generate quiz"):
+            _, qa_pipe = load_models()
+            progress = st.progress(0.0, text="Writing quiz questions...")
+
+            def on_quiz_progress(done, total, label):
+                progress.progress(min(done / total, 1.0), text=label)
+
+            st.session_state.quiz = generate_quiz_cards(
+                qa_pipe,
+                st.session_state["chunks"],
+                on_progress=on_quiz_progress,
+            )
+            progress.empty()
+            st.rerun()
+
+        quiz = st.session_state.get("quiz")
+        if quiz:
+            for i, card in enumerate(quiz, start=1):
+                title = f"Q{i}. {card['question']}"
+                with st.expander(title):
+                    st.write(card["answer"])
+                    if card.get("page"):
+                        st.caption(f"Source: page {card['page']}")
+        else:
+            st.info("Generate a short quiz from your notes when you are ready to review.")
 else:
-    st.write("### 💡 How to use")
-    st.write("1. Provide your study notes via paste or PDF upload.")
-    st.write("2. Click **Generate** to create a smart summary.")
-    st.write("3. Ask specific questions in the chat box to find exact details.")
+    st.write("### How to use")
+    st.write("1. Paste notes or upload a PDF.")
+    st.write("2. Click **Generate study pack** for a summary of the whole document.")
+    st.write("3. Ask questions (with sources) or generate a quiz to review.")
